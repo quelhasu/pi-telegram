@@ -1,5 +1,7 @@
 # pi-telegram
 
+> Full pi build session: [View the session transcript](https://pi.dev/session/#7982ca5cff9717bbcbbc81bb4b2a495b), which captures the full pi session in which `pi-telegram` was built.
+
 Telegram DM bridge for pi.
 
 ## Install
