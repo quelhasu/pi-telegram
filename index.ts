@@ -204,6 +204,14 @@ function isImageMimeType(mimeType: string | undefined): boolean {
 	return mimeType?.toLowerCase().startsWith("image/") ?? false;
 }
 
+function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
 function chunkParagraphs(text: string): string[] {
 	if (text.length <= MAX_MESSAGE_LENGTH) return [text];
 
@@ -748,7 +756,49 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (lower === "/status") {
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, ctx.isIdle() ? "pi is idle." : "pi is busy.");
+			let totalInput = 0;
+			let totalOutput = 0;
+			let totalCacheRead = 0;
+			let totalCacheWrite = 0;
+			let totalCost = 0;
+
+			for (const entry of ctx.sessionManager.getEntries()) {
+				if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+				totalInput += entry.message.usage.input;
+				totalOutput += entry.message.usage.output;
+				totalCacheRead += entry.message.usage.cacheRead;
+				totalCacheWrite += entry.message.usage.cacheWrite;
+				totalCost += entry.message.usage.cost.total;
+			}
+
+			const usage = ctx.getContextUsage();
+			const lines: string[] = [];
+			if (ctx.model) {
+				lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
+			}
+			const tokenParts: string[] = [];
+			if (totalInput) tokenParts.push(`↑${formatTokens(totalInput)}`);
+			if (totalOutput) tokenParts.push(`↓${formatTokens(totalOutput)}`);
+			if (totalCacheRead) tokenParts.push(`R${formatTokens(totalCacheRead)}`);
+			if (totalCacheWrite) tokenParts.push(`W${formatTokens(totalCacheWrite)}`);
+			if (tokenParts.length > 0) {
+				lines.push(`Usage: ${tokenParts.join(" ")}`);
+			}
+			const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
+			if (totalCost || usingSubscription) {
+				lines.push(`Cost: $${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+			}
+			if (usage) {
+				const contextWindow = usage.contextWindow ?? ctx.model?.contextWindow ?? 0;
+				const percent = usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "?";
+				lines.push(`Context: ${percent}/${formatTokens(contextWindow)}`);
+			} else {
+				lines.push("Context: unknown");
+			}
+			if (lines.length === 0) {
+				lines.push("No usage data yet.");
+			}
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
 			return;
 		}
 
