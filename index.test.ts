@@ -35,63 +35,63 @@ describe("formatToolCall", () => {
   it("formats bash tool call", () => {
     assert.equal(
       formatToolCall("bash", { command: "npm test" }),
-      "💻 bash: npm test",
+      "💻 bash: `npm test`",
     );
   });
 
   it("truncates bash command to first line", () => {
     assert.equal(
       formatToolCall("bash", { command: "npm test\nsecond line" }),
-      "💻 bash: npm test",
+      "💻 bash: `npm test`",
     );
   });
 
   it("formats read tool call", () => {
     assert.equal(
       formatToolCall("read", { path: "src/index.ts" }),
-      "📄 read src/index.ts",
+      "📄 read `src/index.ts`",
     );
   });
 
   it("formats edit tool call with edit count", () => {
     assert.equal(
       formatToolCall("edit", { path: "src/index.ts", edits: [{}, {}] }),
-      "✏️ edit src/index.ts (2 edits)",
+      "✏️ edit `src/index.ts` (2 edits)",
     );
   });
 
   it("formats edit tool call without edits", () => {
     assert.equal(
       formatToolCall("edit", { path: "src/index.ts" }),
-      "✏️ edit src/index.ts",
+      "✏️ edit `src/index.ts`",
     );
   });
 
   it("formats write tool call", () => {
     assert.equal(
       formatToolCall("write", { path: "src/new-file.ts" }),
-      "📝 write src/new-file.ts",
+      "📝 write `src/new-file.ts`",
     );
   });
 
   it("formats grep tool call", () => {
     assert.equal(
       formatToolCall("grep", { pattern: "TODO" }),
-      "🔍 grep \"TODO\"",
+      "🔍 grep `TODO`",
     );
   });
 
   it("formats find tool call", () => {
     assert.equal(
       formatToolCall("find", { path: "src/" }),
-      "📁 find src/",
+      "📁 find `src/`",
     );
   });
 
   it("formats ls tool call", () => {
     assert.equal(
       formatToolCall("ls", { path: "src/" }),
-      "📂 ls src/",
+      "📂 ls `src/`",
     );
   });
 

@@ -199,25 +199,25 @@ function formatToolLabel(toolName: string, args: Record<string, unknown>): strin
 	switch (toolName) {
 		case "bash": {
 			const cmd = typeof args.command === "string" ? args.command.split("\n")[0]! : "";
-			return cmd.length > 0 ? `bash: ${cmd}` : "bash";
+			return cmd.length > 0 ? `bash: \`${cmd}\`` : "bash";
 		}
 		case "read":
-			return path ? `read ${path}` : "read";
+			return path ? `read \`${path}\`` : "read";
 		case "edit": {
 			const edits = Array.isArray(args.edits) ? args.edits.length : 0;
-			const base = path ? `edit ${path}` : "edit";
+			const base = path ? `edit \`${path}\`` : "edit";
 			return edits > 0 ? `${base} (${edits} edits)` : base;
 		}
 		case "write":
-			return path ? `write ${path}` : "write";
+			return path ? `write \`${path}\`` : "write";
 		case "grep": {
 			const pattern = typeof args.pattern === "string" ? args.pattern : "";
-			return pattern.length > 0 ? `grep "${pattern}"` : "grep";
+			return pattern.length > 0 ? `grep \`${pattern}\`` : "grep";
 		}
 		case "find":
-			return path ? `find ${path}` : "find";
+			return path ? `find \`${path}\`` : "find";
 		case "ls":
-			return path ? `ls ${path}` : "ls";
+			return path ? `ls \`${path}\`` : "ls";
 		default:
 			return toolName;
 	}
@@ -668,14 +668,24 @@ export default function (pi: ExtensionAPI) {
 		if (typeof processedBody.text === "string") {
 			processedBody.text = formatTablesForTelegram(processedBody.text);
 		}
+		// Try MarkdownV2 first for rich features (blockquote, spoiler, etc.)
 		try {
-			return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "Markdown" });
+			return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "MarkdownV2" });
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
 			if (msg.includes("can't parse entities") || msg.includes("parse")) {
-				console.error("[telegram] Markdown parse failed, falling back to plain text:", msg);
-				const { parse_mode: _, ...plainBody } = processedBody;
-				return await callTelegram<TResponse>(method, plainBody);
+				// Fallback to Markdown legacy (tolerates unescaped _ * etc.)
+				try {
+					return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "Markdown" });
+				} catch (error2) {
+					const msg2 = error2 instanceof Error ? error2.message : String(error2);
+					if (msg2.includes("can't parse entities") || msg2.includes("parse")) {
+						console.error("[telegram] MarkdownV2 + Markdown parse failed, falling back to plain text:", msg2);
+						const { parse_mode: _, ...plainBody } = processedBody;
+						return await callTelegram<TResponse>(method, plainBody);
+					}
+					throw error2;
+				}
 			}
 			throw error;
 		}
