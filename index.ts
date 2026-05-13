@@ -256,25 +256,19 @@ function parseMarkdownCells(lines: string[]): string[][] {
 		.map((l) => l.split("|").slice(1, -1).map((c) => c.trim()));
 }
 
-function isEmojiChar(ch: string): boolean {
-	const cp = ch.codePointAt(0);
-	return cp !== undefined && (
-		(cp >= 0x2600 && cp <= 0x27BF) || // Misc symbols (⭐ ❤️ etc)
-		(cp >= 0x1F000 && cp <= 0x1FFFF) || // Emoticons (🐶 etc)
-		(cp >= 0x2300 && cp <= 0x23FF) || // Misc technical
-		(cp >= 0x2700 && cp <= 0x27BF) || // Dingbats
-		(cp >= 0xFE00 && cp <= 0xFEFF) || // Variation selectors
-		cp === 0x200D // ZWJ
-	);
-}
+const emojiImageCache = new Map<string, ReturnType<typeof loadImage> | null>();
 
 async function loadEmojiImage(emojiDir: string, ch: string): Promise<ReturnType<typeof loadImage> | null> {
+	const cp = [...ch].map((c) => c.codePointAt(0)!.toString(16)).join("-");
+	const cached = emojiImageCache.get(cp);
+	if (cached !== undefined) return cached;
 	try {
-		const cp = [...ch].map((c) => c.codePointAt(0)!.toString(16)).join("-");
 		const path = join(emojiDir, `${cp}.png`);
-		await stat(path); // throw if not exists
-		return await loadImage(path);
+		const img = await loadImage(path);
+		emojiImageCache.set(cp, img);
+		return img;
 	} catch {
+		emojiImageCache.set(cp, null);
 		return null;
 	}
 }
@@ -305,6 +299,19 @@ async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<
 	const fontText = `${FONT_SIZE}px "System Sans", sans-serif`;
 	const fontBold = `bold ${FONT_SIZE}px "System Sans", sans-serif`;
 
+	// Pre-load all emoji images and build per-cell emoji maps
+	const cellEmojis: Array<Array<{ ch: string; img: ReturnType<typeof loadImage> | null }>> = [];
+	for (let r = 0; r < rows.length; r++) {
+		cellEmojis[r] = [];
+		for (let c = 0; c < rows[r].length && c < numCols; c++) {
+			cellEmojis[r][c] = [];
+			for (const ch of rows[r][c]) {
+				const img = await loadEmojiImage(emojiDir, ch);
+				cellEmojis[r][c].push({ ch, img });
+			}
+		}
+	}
+
 	// Measure columns
 	const probe = createCanvas(1, 1);
 	const pctx = probe.getContext("2d");
@@ -313,11 +320,16 @@ async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<
 	for (let r = 0; r < rows.length; r++) {
 		for (let c = 0; c < rows[r].length && c < numCols; c++) {
 			pctx.font = r === 0 ? fontBold : fontText;
-			// Approximate width: text + emojis (each emoji ≈ fontSize wide)
-			const textOnly = [...rows[r][c]].filter((ch) => !isEmojiChar(ch)).join("");
-			const emojiCount = [...rows[r][c]].filter((ch) => isEmojiChar(ch)).length;
-			const w = pctx.measureText(textOnly).width + emojiCount * FONT_SIZE + PADDING_X * 2;
-			if (w > colWidths[c]) colWidths[c] = w;
+			let width = 0;
+			for (const { ch, img } of cellEmojis[r][c]) {
+				if (img) {
+					width += FONT_SIZE;
+				} else {
+					width += pctx.measureText(ch).width;
+				}
+			}
+			width += PADDING_X * 2;
+			if (width > colWidths[c]) colWidths[c] = width;
 		}
 	}
 
@@ -342,41 +354,32 @@ async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<
 			ctx.fillStyle = isHeader ? HEADER_BG : r % 2 === 0 ? ROW_EVEN_BG : ROW_ODD_BG;
 			ctx.fillRect(x, y, cw, lineHeight);
 
-			// Draw content: text then emojis on top
+			// Draw content: each char is either image (emoji) or text
 			let cursorX = x + PADDING_X;
 			const textColorApplied = isHeader ? HEADER_FG : TEXT_COLOR;
+			let textBuffer = "";
 
-			// Pre-load emoji images for this cell
-			const emojiImgs: Array<{ ch: string; img: ReturnType<typeof loadImage> | null }> = [];
-			for (const ch of cell) {
-				if (isEmojiChar(ch)) {
-					emojiImgs.push({ ch, img: await loadEmojiImage(emojiDir, ch) });
+			const flushText = (): void => {
+				if (textBuffer.length > 0) {
+					ctx.font = isHeader ? fontBold : fontText;
+					ctx.fillStyle = textColorApplied;
+					ctx.fillText(textBuffer, cursorX, y + lineHeight / 2);
+					cursorX += ctx.measureText(textBuffer).width;
+					textBuffer = "";
 				}
-			}
+			};
 
-			// Draw text (skip emoji chars)
-			const textOnly = [...cell].filter((ch) => !isEmojiChar(ch)).join("");
-			if (textOnly.length > 0) {
-				ctx.font = isHeader ? fontBold : fontText;
-				ctx.fillStyle = textColorApplied;
-				ctx.fillText(textOnly, cursorX, y + lineHeight / 2);
-				cursorX += ctx.measureText(textOnly).width;
-			}
-
-			// Draw emojis
-			for (const { ch, img } of emojiImgs) {
+			for (const { ch, img } of cellEmojis[r][c]) {
 				if (img) {
+					flushText();
 					const emojiH = FONT_SIZE + 4;
 					ctx.drawImage(img, cursorX, y + (lineHeight - emojiH) / 2, emojiH, emojiH);
 					cursorX += FONT_SIZE;
 				} else {
-					// Fallback: draw as text
-					ctx.font = isHeader ? fontBold : fontText;
-					ctx.fillStyle = textColorApplied;
-					ctx.fillText(ch, cursorX, y + lineHeight / 2);
-					cursorX += ctx.measureText(ch).width;
+					textBuffer += ch;
 				}
 			}
+			flushText();
 
 			// Right border
 			ctx.strokeStyle = BORDER_COLOR;
