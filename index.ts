@@ -232,6 +232,10 @@ export function formatError(error: unknown): string {
 	return `❌ Error: ${message}`;
 }
 
+export function formatAssistantText(text: string): string {
+	return `🤖 ${text}`;
+}
+
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
 }
@@ -955,6 +959,12 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				lines.push("Context: unknown");
 			}
+			const mirrorState = !config.allowedUserId
+				? "off (not paired)"
+				: isMirrorTurn
+				? "active"
+				: "idle";
+			lines.push(`Mirror: ${mirrorState}`);
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
@@ -1130,10 +1140,16 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-status", {
 		description: "Show Telegram bridge status",
 		handler: async (_args, ctx) => {
+			const mirrorState = !config.allowedUserId
+				? "off (not paired)"
+				: isMirrorTurn
+				? "active"
+				: "idle";
 			const status = [
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
+				`mirror: ${mirrorState}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
 			];
@@ -1275,7 +1291,7 @@ export default function (pi: ExtensionAPI) {
 			if (!mirrorPreviewState) {
 				mirrorPreviewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 			}
-			mirrorPreviewState.pendingText = getMessageText(event.message);
+			mirrorPreviewState.pendingText = formatAssistantText(getMessageText(event.message));
 			mirrorSchedulePreviewFlush(mirrorChatId);
 		}
 	});
@@ -1301,7 +1317,10 @@ export default function (pi: ExtensionAPI) {
 					await mirrorClearPreview(mirrorChatId);
 					return;
 				}
-				const finalText = assistant.text || mirrorPreviewState.pendingText || "";
+				const rawText = assistant.text;
+				const finalText = rawText !== undefined
+					? formatAssistantText(rawText)
+					: mirrorPreviewState.pendingText || "";
 				mirrorPreviewState.pendingText = finalText;
 				if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
 					await mirrorFinalizePreview(mirrorChatId);

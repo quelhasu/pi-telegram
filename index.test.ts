@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatPrompt, formatToolCall, formatError } from "./index";
+import { formatPrompt, formatToolCall, formatError, formatAssistantText } from "./index";
 
 describe("formatPrompt", () => {
   it("returns a formatted prompt with emoji prefix", () => {
@@ -143,6 +143,26 @@ describe("formatError", () => {
     assert.equal(
       formatError(undefined),
       "❌ Error: unknown",
+    );
+  });
+});
+
+describe("formatAssistantText", () => {
+  it("prefixes text with robot emoji", () => {
+    assert.equal(
+      formatAssistantText("Let me check that file."),
+      "🤖 Let me check that file.",
+    );
+  });
+
+  it("handles empty string", () => {
+    assert.equal(formatAssistantText(""), "🤖 ");
+  });
+
+  it("preserves existing whitespace", () => {
+    assert.equal(
+      formatAssistantText("  hello  "),
+      "🤖   hello  ",
     );
   });
 });
