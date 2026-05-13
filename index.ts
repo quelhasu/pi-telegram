@@ -155,6 +155,8 @@ interface TelegramMediaGroupState {
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+const EMOJI_CACHE_DIR = join(TEMP_DIR, "assets", "emoji");
+const TWEMOJI_CDN = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14/assets/72x72";
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -258,13 +260,40 @@ function parseMarkdownCells(lines: string[]): string[][] {
 
 const emojiImageCache = new Map<string, ReturnType<typeof loadImage> | null>();
 
-async function loadEmojiImage(emojiDir: string, ch: string): Promise<ReturnType<typeof loadImage> | null> {
+async function loadEmojiImage(ch: string): Promise<ReturnType<typeof loadImage> | null> {
 	const cp = [...ch].map((c) => c.codePointAt(0)!.toString(16)).join("-");
 	const cached = emojiImageCache.get(cp);
 	if (cached !== undefined) return cached;
+
+	// Fast skip: ASCII letters/digits/whitespace/punctuation are never emojis
+	const code = ch.codePointAt(0)!;
+	if (code < 0x80 && /[a-zA-Z0-9\s,.;:!?()\[\]{}"'_\/\\<>=@~`^|&%$\-+]/.test(ch)) {
+		emojiImageCache.set(cp, null);
+		return null;
+	}
+
+	// Try cached dir first, then bundled assets, then CDN
+	const paths = [
+		join(EMOJI_CACHE_DIR, `${cp}.png`),
+		join(process.cwd(), "assets", "emoji", `${cp}.png`),
+	];
+	for (const path of paths) {
+		try {
+			const img = await loadImage(path);
+			emojiImageCache.set(cp, img);
+			return img;
+		} catch { /* continue */ }
+	}
+
+	// Download from Twemoji CDN
 	try {
-		const path = join(emojiDir, `${cp}.png`);
-		const img = await loadImage(path);
+		const url = `${TWEMOJI_CDN}/${cp}.png`;
+		const response = await fetch(url);
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const buffer = Buffer.from(await response.arrayBuffer());
+		await mkdir(EMOJI_CACHE_DIR, { recursive: true });
+		await writeFile(join(EMOJI_CACHE_DIR, `${cp}.png`), buffer);
+		const img = await loadImage(join(EMOJI_CACHE_DIR, `${cp}.png`));
 		emojiImageCache.set(cp, img);
 		return img;
 	} catch {
@@ -273,16 +302,12 @@ async function loadEmojiImage(emojiDir: string, ch: string): Promise<ReturnType<
 	}
 }
 
-function registerSystemFonts(fontDir: string): void {
-	try {
-		GlobalFonts.registerFromPath(join(fontDir, "DejaVuSans.ttf"), "System Sans");
-		GlobalFonts.registerFromPath(join(fontDir, "DejaVuSans-Bold.ttf"), "System Sans");
-	} catch {
-		// font not bundled; system sans-serif will be used
-	}
+function registerSystemFonts(): void {
+	// Use system sans-serif fonts — no bundled fonts needed
+	// @napi-rs/canvas will use font-kit to find sans-serif on the system
 }
 
-async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<ReturnType<typeof createCanvas>> {
+async function renderTableToCanvas(rows: string[][]): Promise<ReturnType<typeof createCanvas>> {
 	if (rows.length === 0) return createCanvas(1, 1);
 
 	const FONT_SIZE = 15;
@@ -306,7 +331,7 @@ async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<
 		for (let c = 0; c < rows[r].length && c < numCols; c++) {
 			cellEmojis[r][c] = [];
 			for (const ch of rows[r][c]) {
-				const img = await loadEmojiImage(emojiDir, ch);
+				const img = await loadEmojiImage(ch);
 				cellEmojis[r][c].push({ ch, img });
 			}
 		}
@@ -408,13 +433,9 @@ async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<
 
 export async function renderTableToPng(tableLines: string[], outputPath: string): Promise<void> {
 	const rows = parseMarkdownCells(tableLines);
-	const fontDir = join(process.cwd(), "assets", "fonts");
-	const emojiDir = join(process.cwd(), "assets", "emoji");
-
-	// Load fonts once at module level? No, per call is fine (cached by GlobalFonts)
-	registerSystemFonts(fontDir);
+	registerSystemFonts();
 	await mkdir(dirname(outputPath), { recursive: true });
-	const canvas = await renderTableToCanvas(rows, emojiDir);
+	const canvas = await renderTableToCanvas(rows);
 	await writeFile(outputPath, canvas.toBuffer("image/png"));
 }
 
