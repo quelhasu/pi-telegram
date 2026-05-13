@@ -1,6 +1,7 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
+import sharp from "sharp";
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -171,11 +172,14 @@ Telegram bridge extension is active.
 export function formatPrompt(text: string): string {
 	const trimmed = text.trim();
 	if (trimmed.length === 0) return "💬 You: (empty)";
+	const hasBlockquote = trimmed.split("\n").some((line) => line.trimStart().startsWith(">"));
+	const prefix = "💬 You:";
+	const separator = hasBlockquote ? "\n" : " ";
 	const MAX_PROMPT = 400;
 	if (trimmed.length > MAX_PROMPT) {
-		return `💬 You: ${trimmed.slice(0, MAX_PROMPT)}…`;
+		return `${prefix}${separator}${trimmed.slice(0, MAX_PROMPT)}…`;
 	}
-	return `💬 You: ${trimmed}`;
+	return `${prefix}${separator}${trimmed}`;
 }
 
 export function formatToolCall(toolName: string, args: Record<string, unknown>): string {
@@ -242,6 +246,82 @@ export function formatEditDiff(diff: string): string {
 	if (trimmed.length <= MAX_DIFF) return `\`\`\`diff\n${trimmed}\n\`\`\``;
 	const truncated = trimmed.slice(0, MAX_DIFF);
 	return `\`\`\`diff\n${truncated}\n...\n\`\`\``;
+}
+
+export async function renderTableToPng(tableLines: string[], outputPath: string): Promise<void> {
+	const CHAR_WIDTH = 9;
+	const LINE_HEIGHT = 20;
+	const PADDING = 16;
+	const maxLen = Math.max(...tableLines.map((l) => l.length));
+	const width = maxLen * CHAR_WIDTH + PADDING * 2;
+	const height = tableLines.length * LINE_HEIGHT + PADDING * 2;
+
+	const escapedLines = tableLines
+		.map((line) => line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"))
+		.map((line) => `<tspan x="${PADDING}" dy="${LINE_HEIGHT}">${line}</tspan>`)
+		.join("");
+
+	const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+  <rect width="100%" height="100%" fill="#f6f8fa"/>
+  <text font-family="monospace" font-size="14" fill="#24292f" y="${PADDING - 4}">
+    ${escapedLines}
+  </text>
+</svg>`;
+
+	await sharp(Buffer.from(svg)).png().toFile(outputPath);
+}
+
+export async function extractTableSegments(text: string): Promise<Array<{ type: "text"; text: string } | { type: "table"; lines: string[] }>> {
+	const lines = text.split("\n");
+	const segments: Array<{ type: "text"; text: string } | { type: "table"; lines: string[] }> = [];
+	let currentText: string[] = [];
+	let tableBuffer: string[] = [];
+	let inTable = false;
+	let inCodeBlock = false;
+
+	const flushText = (): void => {
+		if (currentText.length > 0) {
+			const t = currentText.join("\n").trim();
+			if (t.length > 0) segments.push({ type: "text", text: t });
+			currentText = [];
+		}
+	};
+
+	const flushTable = (): void => {
+		if (tableBuffer.length > 0) {
+			segments.push({ type: "table", lines: [...tableBuffer] });
+			tableBuffer = [];
+			inTable = false;
+		}
+	};
+
+	for (const line of lines) {
+		if (line.trim().startsWith("```")) {
+			if (inTable) flushTable();
+			inCodeBlock = !inCodeBlock;
+			currentText.push(line);
+			continue;
+		}
+		if (inCodeBlock) {
+			currentText.push(line);
+			continue;
+		}
+		const isTableRow = /^\s*\|/.test(line) || /^\s*\+[-+]/.test(line);
+		if (isTableRow) {
+			flushText();
+			if (!inTable) inTable = true;
+			tableBuffer.push(line);
+			continue;
+		}
+		if (inTable) {
+			flushTable();
+		}
+		currentText.push(line);
+	}
+	flushText();
+	if (inTable) flushTable();
+	return segments;
 }
 
 function isTelegramPrompt(prompt: string): boolean {
@@ -576,7 +656,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendFinalMessage(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
@@ -652,7 +732,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendFinalMessage(chatId, finalText);
 			await mirrorClearPreview(chatId);
 			return true;
 		}
@@ -733,17 +813,50 @@ export default function (pi: ExtensionAPI) {
 		return out.join("\n");
 	}
 
-	async function sendFormattedText(chatId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
+	async function sendFinalMessage(chatId: number, text: string, replyToMessageId?: number): Promise<number | undefined> {
+		const segments = await extractTableSegments(text);
 		let lastMessageId: number | undefined;
-		for (const chunk of chunks) {
-			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
+		let replyTo = replyToMessageId;
+		for (const segment of segments) {
+			const replyParam = replyTo !== undefined ? { reply_to_message_id: replyTo } : {};
+			if (segment.type === "table") {
+				const tmpPath = join(TEMP_DIR, `table-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+				await mkdir(TEMP_DIR, { recursive: true });
+				await renderTableToPng(segment.lines, tmpPath);
+				try {
+					const sent = await callTelegramMultipart<TelegramSentMessage>(
+						"sendPhoto",
+						{ chat_id: String(chatId), ...replyParam },
+						"photo",
+						tmpPath,
+						"table.png",
+					);
+					lastMessageId = sent.message_id;
+				} finally {
+					try {
+						await unlink(tmpPath);
+					} catch {
+						/* ignore cleanup errors */
+					}
+				}
+			} else {
+				const chunks = chunkParagraphs(segment.text);
+				for (const chunk of chunks) {
+					const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", {
+						chat_id: chatId,
+						text: chunk,
+						...replyParam,
+					});
+					lastMessageId = sent.message_id;
+				}
+			}
+			if (replyTo !== undefined) replyTo = undefined;
 		}
 		return lastMessageId;
+	}
+
+	async function sendFormattedText(chatId: number, text: string): Promise<number | undefined> {
+		return sendFinalMessage(chatId, text);
 	}
 
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
@@ -1297,7 +1410,7 @@ export default function (pi: ExtensionAPI) {
 		startTypingLoop(ctx, mirrorChatId);
 		const text = formatPrompt(event.text);
 		try {
-			await sendWithMarkdown("sendMessage", { chat_id: mirrorChatId, text });
+			await sendFinalMessage(mirrorChatId, text);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("[telegram mirror] input send failed:", message);
@@ -1311,8 +1424,10 @@ export default function (pi: ExtensionAPI) {
 		if (mirrorChatId === undefined) return;
 		const text = formatToolCall(event.toolName, event.input as Record<string, unknown>);
 		try {
-			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: mirrorChatId, text });
-			mirrorToolMessages.set(event.toolCallId, sent.message_id);
+			const sent = await sendFinalMessage(mirrorChatId, text);
+			if (sent !== undefined) {
+				mirrorToolMessages.set(event.toolCallId, sent);
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("[telegram mirror] tool_call send failed:", message);
@@ -1330,9 +1445,7 @@ export default function (pi: ExtensionAPI) {
 		const diffText = formatEditDiff(details.diff);
 		const replyTo = mirrorToolMessages.get(event.toolCallId);
 		try {
-			const body: Record<string, unknown> = { chat_id: mirrorChatId, text: diffText };
-			if (replyTo !== undefined) body.reply_to_message_id = replyTo;
-			await sendWithMarkdown("sendMessage", body);
+			await sendFinalMessage(mirrorChatId, diffText, replyTo);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("[telegram mirror] edit diff send failed:", message);
@@ -1434,7 +1547,7 @@ export default function (pi: ExtensionAPI) {
 						const chunks = chunkParagraphs(finalText);
 						for (const chunk of chunks) {
 							try {
-								await sendWithMarkdown("sendMessage", { chat_id: mirrorChatId, text: chunk });
+								await sendFinalMessage(mirrorChatId, chunk);
 							} catch (error) {
 								const message = error instanceof Error ? error.message : String(error);
 								console.error("[telegram mirror] final response chunk send failed:", message);
