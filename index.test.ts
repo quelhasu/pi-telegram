@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { stat } from "node:fs/promises";
+import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { formatPrompt, formatToolCall, formatError, formatAssistantText, formatEditDiff, renderTableToPng, extractTableSegments } from "./index";
 
 describe("formatPrompt", () => {
@@ -206,7 +207,7 @@ describe("formatEditDiff", () => {
 });
 
 describe("renderTableToPng", () => {
-  it("creates a PNG file from table lines", async () => {
+  it("creates a valid PNG file", async () => {
     const tmpPath = `/tmp/test-table-${Date.now()}.png`;
     await renderTableToPng(
       ["| Col A | Col B |", "|-------|-------|", "| val1  | val2  |"],
@@ -215,6 +216,66 @@ describe("renderTableToPng", () => {
     const s = await stat(tmpPath);
     assert.ok(s.isFile());
     assert.ok(s.size > 0);
+  });
+
+  it("renders readable text (dark pixels present)", async () => {
+    const tmpPath = `/tmp/test-text-${Date.now()}.png`;
+    await renderTableToPng(
+      ["| Name | Role |", "|------|------|", "| Alice | Admin |"],
+      tmpPath,
+    );
+    const img = await loadImage(tmpPath);
+    const canvas = createCanvas(img.width, img.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    const { data } = ctx.getImageData(0, 0, img.width, img.height);
+    let darkPixels = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      if (r + g + b < 200) darkPixels++;
+    }
+    assert.ok(darkPixels > 100, `Expected >100 dark pixels, got ${darkPixels}`);
+  });
+
+  it("renders emojis (color pixels present)", async () => {
+    const tmpPath = `/tmp/test-emoji-${Date.now()}.png`;
+    await renderTableToPng(
+      ["| Emoji | Meaning |", "|-------|---------|", "| ⭐ | Star |"],
+      tmpPath,
+    );
+    const img = await loadImage(tmpPath);
+    const canvas = createCanvas(img.width, img.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    const { data } = ctx.getImageData(0, 0, img.width, img.height);
+    let colorPixels = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      if (!(Math.abs(r - g) < 15 && Math.abs(g - b) < 15)) colorPixels++;
+    }
+    assert.ok(colorPixels > 50, `Expected >50 color pixels, got ${colorPixels}`);
+  });
+
+  it("renders header with distinct background", async () => {
+    const tmpPath = `/tmp/test-header-${Date.now()}.png`;
+    await renderTableToPng(
+      ["| H1 | H2 |", "|----|----|", "| A | B |"],
+      tmpPath,
+    );
+    const img = await loadImage(tmpPath);
+    const canvas = createCanvas(img.width, img.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    // Sample top row (header) and second row
+    const topRow = ctx.getImageData(0, 5, img.width, 1).data;
+    const bodyRow = ctx.getImageData(0, Math.floor(img.height / 2), img.width, 1).data;
+    let topAvg = 0, bodyAvg = 0;
+    for (let i = 0; i < topRow.length; i += 4) topAvg += (topRow[i] + topRow[i + 1] + topRow[i + 2]) / 3;
+    for (let i = 0; i < bodyRow.length; i += 4) bodyAvg += (bodyRow[i] + bodyRow[i + 1] + bodyRow[i + 2]) / 3;
+    topAvg /= (topRow.length / 4);
+    bodyAvg /= (bodyRow.length / 4);
+    // Header should be darker than body
+    assert.ok(topAvg < bodyAvg, `Header ${topAvg.toFixed(0)} should be darker than body ${bodyAvg.toFixed(0)}`);
   });
 });
 

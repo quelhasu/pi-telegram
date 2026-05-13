@@ -1,7 +1,8 @@
 import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, dirname } from "node:path";
 import { homedir } from "node:os";
-import sharp from "sharp";
+import { fileURLToPath } from "node:url";
+import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -248,28 +249,170 @@ export function formatEditDiff(diff: string): string {
 	return `\`\`\`diff\n${truncated}\n...\n\`\`\``;
 }
 
+function parseMarkdownCells(lines: string[]): string[][] {
+	return lines
+		.filter((l) => l.trim().startsWith("|"))
+		.filter((l) => !/^\|[\s:-]+\|/.test(l)) // skip separator
+		.map((l) => l.split("|").slice(1, -1).map((c) => c.trim()));
+}
+
+function isEmojiChar(ch: string): boolean {
+	const cp = ch.codePointAt(0);
+	return cp !== undefined && (
+		(cp >= 0x2600 && cp <= 0x27BF) || // Misc symbols (⭐ ❤️ etc)
+		(cp >= 0x1F000 && cp <= 0x1FFFF) || // Emoticons (🐶 etc)
+		(cp >= 0x2300 && cp <= 0x23FF) || // Misc technical
+		(cp >= 0x2700 && cp <= 0x27BF) || // Dingbats
+		(cp >= 0xFE00 && cp <= 0xFEFF) || // Variation selectors
+		cp === 0x200D // ZWJ
+	);
+}
+
+async function loadEmojiImage(emojiDir: string, ch: string): Promise<ReturnType<typeof loadImage> | null> {
+	try {
+		const cp = [...ch].map((c) => c.codePointAt(0)!.toString(16)).join("-");
+		const path = join(emojiDir, `${cp}.png`);
+		await stat(path); // throw if not exists
+		return await loadImage(path);
+	} catch {
+		return null;
+	}
+}
+
+function registerSystemFonts(fontDir: string): void {
+	try {
+		GlobalFonts.registerFromPath(join(fontDir, "DejaVuSans.ttf"), "System Sans");
+		GlobalFonts.registerFromPath(join(fontDir, "DejaVuSans-Bold.ttf"), "System Sans");
+	} catch {
+		// font not bundled; system sans-serif will be used
+	}
+}
+
+async function renderTableToCanvas(rows: string[][], emojiDir: string): Promise<ReturnType<typeof createCanvas>> {
+	if (rows.length === 0) return createCanvas(1, 1);
+
+	const FONT_SIZE = 15;
+	const PADDING_X = 14;
+	const PADDING_Y = 10;
+	const HEADER_BG = "#374151";
+	const HEADER_FG = "#f9fafb";
+	const ROW_EVEN_BG = "#ffffff";
+	const ROW_ODD_BG = "#f9fafb";
+	const TEXT_COLOR = "#1f2937";
+	const BORDER_COLOR = "#d1d5db";
+
+	const numCols = rows[0].length;
+	const fontText = `${FONT_SIZE}px "System Sans", sans-serif`;
+	const fontBold = `bold ${FONT_SIZE}px "System Sans", sans-serif`;
+
+	// Measure columns
+	const probe = createCanvas(1, 1);
+	const pctx = probe.getContext("2d");
+	const colWidths = Array(numCols).fill(0);
+
+	for (let r = 0; r < rows.length; r++) {
+		for (let c = 0; c < rows[r].length && c < numCols; c++) {
+			pctx.font = r === 0 ? fontBold : fontText;
+			// Approximate width: text + emojis (each emoji ≈ fontSize wide)
+			const textOnly = [...rows[r][c]].filter((ch) => !isEmojiChar(ch)).join("");
+			const emojiCount = [...rows[r][c]].filter((ch) => isEmojiChar(ch)).length;
+			const w = pctx.measureText(textOnly).width + emojiCount * FONT_SIZE + PADDING_X * 2;
+			if (w > colWidths[c]) colWidths[c] = w;
+		}
+	}
+
+	const lineHeight = FONT_SIZE + PADDING_Y * 2;
+	const totalWidth = colWidths.reduce((a, b) => a + b, 0) + 2;
+	const totalHeight = rows.length * lineHeight;
+
+	const canvas = createCanvas(Math.ceil(totalWidth), Math.ceil(totalHeight));
+	const ctx = canvas.getContext("2d");
+	ctx.textBaseline = "middle";
+
+	let y = 0;
+	for (let r = 0; r < rows.length; r++) {
+		const isHeader = r === 0;
+		let x = 1;
+
+		for (let c = 0; c < rows[r].length && c < numCols; c++) {
+			const cell = rows[r][c];
+			const cw = colWidths[c];
+
+			// Cell background
+			ctx.fillStyle = isHeader ? HEADER_BG : r % 2 === 0 ? ROW_EVEN_BG : ROW_ODD_BG;
+			ctx.fillRect(x, y, cw, lineHeight);
+
+			// Draw content: text then emojis on top
+			let cursorX = x + PADDING_X;
+			const textColorApplied = isHeader ? HEADER_FG : TEXT_COLOR;
+
+			// Pre-load emoji images for this cell
+			const emojiImgs: Array<{ ch: string; img: ReturnType<typeof loadImage> | null }> = [];
+			for (const ch of cell) {
+				if (isEmojiChar(ch)) {
+					emojiImgs.push({ ch, img: await loadEmojiImage(emojiDir, ch) });
+				}
+			}
+
+			// Draw text (skip emoji chars)
+			const textOnly = [...cell].filter((ch) => !isEmojiChar(ch)).join("");
+			if (textOnly.length > 0) {
+				ctx.font = isHeader ? fontBold : fontText;
+				ctx.fillStyle = textColorApplied;
+				ctx.fillText(textOnly, cursorX, y + lineHeight / 2);
+				cursorX += ctx.measureText(textOnly).width;
+			}
+
+			// Draw emojis
+			for (const { ch, img } of emojiImgs) {
+				if (img) {
+					const emojiH = FONT_SIZE + 4;
+					ctx.drawImage(img, cursorX, y + (lineHeight - emojiH) / 2, emojiH, emojiH);
+					cursorX += FONT_SIZE;
+				} else {
+					// Fallback: draw as text
+					ctx.font = isHeader ? fontBold : fontText;
+					ctx.fillStyle = textColorApplied;
+					ctx.fillText(ch, cursorX, y + lineHeight / 2);
+					cursorX += ctx.measureText(ch).width;
+				}
+			}
+
+			// Right border
+			ctx.strokeStyle = BORDER_COLOR;
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			ctx.moveTo(x + cw, y);
+			ctx.lineTo(x + cw, y + lineHeight);
+			ctx.stroke();
+
+			x += cw;
+		}
+
+		// Bottom border
+		ctx.strokeStyle = BORDER_COLOR;
+		ctx.lineWidth = isHeader ? 2 : 1;
+		ctx.beginPath();
+		ctx.moveTo(0, y + lineHeight);
+		ctx.lineTo(totalWidth, y + lineHeight);
+		ctx.stroke();
+
+		y += lineHeight;
+	}
+
+	return canvas;
+}
+
 export async function renderTableToPng(tableLines: string[], outputPath: string): Promise<void> {
-	const CHAR_WIDTH = 9;
-	const LINE_HEIGHT = 20;
-	const PADDING = 16;
-	const maxLen = Math.max(...tableLines.map((l) => l.length));
-	const width = maxLen * CHAR_WIDTH + PADDING * 2;
-	const height = tableLines.length * LINE_HEIGHT + PADDING * 2;
+	const rows = parseMarkdownCells(tableLines);
+	const fontDir = join(process.cwd(), "assets", "fonts");
+	const emojiDir = join(process.cwd(), "assets", "emoji");
 
-	const escapedLines = tableLines
-		.map((line) => line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"))
-		.map((line) => `<tspan x="${PADDING}" dy="${LINE_HEIGHT}">${line}</tspan>`)
-		.join("");
-
-	const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-  <rect width="100%" height="100%" fill="#f6f8fa"/>
-  <text font-family="monospace" font-size="14" fill="#24292f" y="${PADDING - 4}">
-    ${escapedLines}
-  </text>
-</svg>`;
-
-	await sharp(Buffer.from(svg)).png().toFile(outputPath);
+	// Load fonts once at module level? No, per call is fine (cached by GlobalFonts)
+	registerSystemFonts(fontDir);
+	await mkdir(dirname(outputPath), { recursive: true });
+	const canvas = await renderTableToCanvas(rows, emojiDir);
+	await writeFile(outputPath, canvas.toBuffer("image/png"));
 }
 
 export async function extractTableSegments(text: string): Promise<Array<{ type: "text"; text: string } | { type: "table"; lines: string[] }>> {

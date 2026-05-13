@@ -32,6 +32,6 @@
     "@sinclair/typebox": "*"
   },
   "dependencies": {
-    "sharp": "^0.34.5"
+    "@napi-rs/canvas": "^1.0.0"
   }
 }
