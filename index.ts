@@ -2,9 +2,9 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 interface TelegramConfig {
@@ -168,6 +168,74 @@ Telegram bridge extension is active.
 - If a [telegram] user asked for a file or generated artifact, use the telegram_attach tool with the local file path so the extension can send it with your next final reply.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.`;
 
+export function formatPrompt(text: string): string {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) return "💬 You: (empty)";
+	const firstLine = trimmed.split("\n")[0]!;
+	const MAX_PROMPT = 200;
+	if (firstLine.length > MAX_PROMPT) {
+		return `💬 You: ${firstLine.slice(0, MAX_PROMPT)}…`;
+	}
+	return `💬 You: ${firstLine}`;
+}
+
+export function formatToolCall(toolName: string, args: Record<string, unknown>): string {
+	const label = formatToolLabel(toolName, args);
+	const emoji = TOOL_EMOJI[toolName] ?? "🔧";
+	return `${emoji} ${label}`;
+}
+
+const TOOL_EMOJI: Record<string, string> = {
+	bash: "💻",
+	read: "📄",
+	edit: "✏️",
+	write: "📝",
+	grep: "🔍",
+	find: "📁",
+	ls: "📂",
+};
+
+function formatToolLabel(toolName: string, args: Record<string, unknown>): string {
+	const path = typeof args.path === "string" ? args.path : undefined;
+	switch (toolName) {
+		case "bash": {
+			const cmd = typeof args.command === "string" ? args.command.split("\n")[0]! : "";
+			return cmd.length > 0 ? `bash: ${cmd}` : "bash";
+		}
+		case "read":
+			return path ? `read ${path}` : "read";
+		case "edit": {
+			const edits = Array.isArray(args.edits) ? args.edits.length : 0;
+			const base = path ? `edit ${path}` : "edit";
+			return edits > 0 ? `${base} (${edits} edits)` : base;
+		}
+		case "write":
+			return path ? `write ${path}` : "write";
+		case "grep": {
+			const pattern = typeof args.pattern === "string" ? args.pattern : "";
+			return pattern.length > 0 ? `grep "${pattern}"` : "grep";
+		}
+		case "find":
+			return path ? `find ${path}` : "find";
+		case "ls":
+			return path ? `ls ${path}` : "ls";
+		default:
+			return toolName;
+	}
+}
+
+export function formatError(error: unknown): string {
+	const message =
+		error instanceof Error ? error.message :
+		typeof error === "string" ? error :
+		"unknown";
+	return `❌ Error: ${message}`;
+}
+
+export function formatAssistantText(text: string): string {
+	return `🤖 ${text}`;
+}
+
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
 }
@@ -293,8 +361,10 @@ export default function (pi: ExtensionAPI) {
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
+	let isMirrorTurn = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
+	let mirrorPreviewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
@@ -502,6 +572,82 @@ export default function (pi: ExtensionAPI) {
 			return true;
 		}
 		previewState = undefined;
+		return state.messageId !== undefined;
+	}
+
+	async function mirrorClearPreview(chatId: number): Promise<void> {
+		const state = mirrorPreviewState;
+		if (!state) return;
+		if (state.flushTimer) {
+			clearTimeout(state.flushTimer);
+			state.flushTimer = undefined;
+		}
+		mirrorPreviewState = undefined;
+		if (state.mode === "draft" && state.draftId !== undefined) {
+			try {
+				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	async function mirrorFlushPreview(chatId: number): Promise<void> {
+		const state = mirrorPreviewState;
+		if (!state) return;
+		state.flushTimer = undefined;
+		const text = state.pendingText.trim();
+		if (!text || text === state.lastSentText) return;
+		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+
+		if (draftSupport !== "unsupported") {
+			const draftId = state.draftId ?? allocateDraftId();
+			state.draftId = draftId;
+			try {
+				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				draftSupport = "supported";
+				state.mode = "draft";
+				state.lastSentText = truncated;
+				return;
+			} catch {
+				draftSupport = "unsupported";
+			}
+		}
+
+		if (state.messageId === undefined) {
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			state.messageId = sent.message_id;
+			state.mode = "message";
+			state.lastSentText = truncated;
+			return;
+		}
+		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		state.mode = "message";
+		state.lastSentText = truncated;
+	}
+
+	function mirrorSchedulePreviewFlush(chatId: number): void {
+		if (!mirrorPreviewState || mirrorPreviewState.flushTimer) return;
+		mirrorPreviewState.flushTimer = setTimeout(() => {
+			void mirrorFlushPreview(chatId);
+		}, PREVIEW_THROTTLE_MS);
+	}
+
+	async function mirrorFinalizePreview(chatId: number): Promise<boolean> {
+		const state = mirrorPreviewState;
+		if (!state) return false;
+		await mirrorFlushPreview(chatId);
+		const finalText = (state.pendingText.trim() || state.lastSentText).trim();
+		if (!finalText) {
+			await mirrorClearPreview(chatId);
+			return false;
+		}
+		if (state.mode === "draft") {
+			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await mirrorClearPreview(chatId);
+			return true;
+		}
+		mirrorPreviewState = undefined;
 		return state.messageId !== undefined;
 	}
 
@@ -813,6 +959,12 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				lines.push("Context: unknown");
 			}
+			const mirrorState = !config.allowedUserId
+				? "off (not paired)"
+				: isMirrorTurn
+				? "active"
+				: "idle";
+			lines.push(`Mirror: ${mirrorState}`);
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
@@ -988,10 +1140,16 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-status", {
 		description: "Show Telegram bridge status",
 		handler: async (_args, ctx) => {
+			const mirrorState = !config.allowedUserId
+				? "off (not paired)"
+				: isMirrorTurn
+				? "active"
+				: "idle";
 			const status = [
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
+				`mirror: ${mirrorState}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
 			];
@@ -1028,10 +1186,15 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
+		isMirrorTurn = false;
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
 		mediaGroups.clear();
+		if (mirrorPreviewState && config.allowedUserId !== undefined) {
+			await mirrorClearPreview(config.allowedUserId);
+		}
+		mirrorPreviewState = undefined;
 		if (activeTelegramTurn) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
@@ -1039,6 +1202,38 @@ export default function (pi: ExtensionAPI) {
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
 		await stopPolling();
+	});
+
+	pi.on("input", async (event, ctx) => {
+		const mirrorChatId = config.allowedUserId;
+		if (mirrorChatId === undefined) return;
+		if (event.source === "extension") {
+			isMirrorTurn = false;
+			return;
+		}
+		isMirrorTurn = true;
+		startTypingLoop(ctx, mirrorChatId);
+		const text = formatPrompt(event.text);
+		try {
+			await callTelegram("sendMessage", { chat_id: mirrorChatId, text });
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error("[telegram mirror] input send failed:", message);
+		}
+	});
+
+	pi.on("tool_call", async (event) => {
+		if (!isMirrorTurn) return;
+		if (activeTelegramTurn) return;
+		const mirrorChatId = config.allowedUserId;
+		if (mirrorChatId === undefined) return;
+		const text = formatToolCall(event.toolName, event.input as Record<string, unknown>);
+		try {
+			await callTelegram("sendMessage", { chat_id: mirrorChatId, text });
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error("[telegram mirror] tool_call send failed:", message);
+		}
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -1064,29 +1259,80 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("message_start", async (event, _ctx) => {
-		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
-			await finalizePreview(activeTelegramTurn.chatId);
+		if (activeTelegramTurn && isAssistantMessage(event.message)) {
+			if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
+				await finalizePreview(activeTelegramTurn.chatId);
+			}
+			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			return;
 		}
-		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		if (!activeTelegramTurn && isMirrorTurn && isAssistantMessage(event.message)) {
+			const mirrorChatId = config.allowedUserId;
+			if (mirrorChatId === undefined) return;
+			if (mirrorPreviewState && (mirrorPreviewState.pendingText.trim().length > 0 || mirrorPreviewState.lastSentText.trim().length > 0)) {
+				await mirrorFinalizePreview(mirrorChatId);
+			}
+			mirrorPreviewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		}
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
-		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		if (activeTelegramTurn && isAssistantMessage(event.message)) {
+			if (!previewState) {
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			}
+			previewState.pendingText = getMessageText(event.message);
+			schedulePreviewFlush(activeTelegramTurn.chatId);
+			return;
 		}
-		previewState.pendingText = getMessageText(event.message);
-		schedulePreviewFlush(activeTelegramTurn.chatId);
+		if (!activeTelegramTurn && isMirrorTurn && isAssistantMessage(event.message)) {
+			const mirrorChatId = config.allowedUserId;
+			if (mirrorChatId === undefined) return;
+			if (!mirrorPreviewState) {
+				mirrorPreviewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			}
+			mirrorPreviewState.pendingText = formatAssistantText(getMessageText(event.message));
+			mirrorSchedulePreviewFlush(mirrorChatId);
+		}
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
 		const turn = activeTelegramTurn;
+		isMirrorTurn = false;
 		currentAbort = undefined;
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
 		updateStatus(ctx);
-		if (!turn) return;
+
+		// Mirror finalization (terminal/RPC-initiated turns)
+		if (!turn) {
+			const mirrorChatId = config.allowedUserId;
+			if (mirrorChatId !== undefined && mirrorPreviewState) {
+				const assistant = extractAssistantText(event.messages);
+				if (assistant.stopReason === "aborted") {
+					await mirrorClearPreview(mirrorChatId);
+					return;
+				}
+				if (assistant.stopReason === "error") {
+					await mirrorClearPreview(mirrorChatId);
+					return;
+				}
+				const rawText = assistant.text;
+				const finalText = rawText !== undefined
+					? formatAssistantText(rawText)
+					: mirrorPreviewState.pendingText || "";
+				mirrorPreviewState.pendingText = finalText;
+				if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+					await mirrorFinalizePreview(mirrorChatId);
+				} else {
+					await mirrorClearPreview(mirrorChatId);
+					if (finalText) {
+						await sendTextReply(mirrorChatId, 0, finalText);
+					}
+				}
+			}
+			return;
+		}
 
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
