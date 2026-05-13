@@ -664,17 +664,63 @@ export default function (pi: ExtensionAPI) {
 		method: string,
 		body: Record<string, unknown>,
 	): Promise<TResponse> {
+		const processedBody = { ...body };
+		if (typeof processedBody.text === "string") {
+			processedBody.text = formatTablesForTelegram(processedBody.text);
+		}
 		try {
-			return await callTelegram<TResponse>(method, { ...body, parse_mode: "Markdown" });
+			return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "Markdown" });
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
 			if (msg.includes("can't parse entities") || msg.includes("parse")) {
-				console.error("[telegram mirror] Markdown parse failed, falling back to plain text:", msg);
-				const { parse_mode: _, ...plainBody } = body;
+				console.error("[telegram] Markdown parse failed, falling back to plain text:", msg);
+				const { parse_mode: _, ...plainBody } = processedBody;
 				return await callTelegram<TResponse>(method, plainBody);
 			}
 			throw error;
 		}
+	}
+
+	function formatTablesForTelegram(text: string): string {
+		const lines = text.split("\n");
+		const out: string[] = [];
+		let inTable = false;
+		let tableBuffer: string[] = [];
+		let inCodeBlock = false;
+
+		const flushTable = (): void => {
+			if (tableBuffer.length === 0) return;
+			out.push("```");
+			out.push(...tableBuffer);
+			out.push("```");
+			tableBuffer = [];
+			inTable = false;
+		};
+
+		for (const line of lines) {
+			if (line.trim().startsWith("```")) {
+				if (inTable) flushTable();
+				inCodeBlock = !inCodeBlock;
+				out.push(line);
+				continue;
+			}
+			if (inCodeBlock) {
+				out.push(line);
+				continue;
+			}
+			const isTableRow = /^\s*\|/.test(line) || /^\s*\+[-+]/.test(line);
+			if (isTableRow) {
+				if (!inTable) inTable = true;
+				tableBuffer.push(line);
+				continue;
+			}
+			if (inTable) {
+				flushTable();
+			}
+			out.push(line);
+		}
+		if (inTable) flushTable();
+		return out.join("\n");
 	}
 
 	async function sendFormattedText(chatId: number, text: string): Promise<number | undefined> {
