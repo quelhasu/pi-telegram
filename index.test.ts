@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatPrompt, formatToolCall, formatError, formatAssistantText } from "./index";
+import { formatPrompt, formatToolCall, formatError, formatAssistantText, formatEditDiff } from "./index";
 
 describe("formatPrompt", () => {
   it("returns a formatted prompt with emoji prefix", () => {
@@ -164,5 +164,27 @@ describe("formatAssistantText", () => {
       formatAssistantText("  hello  "),
       "🤖   hello  ",
     );
+  });
+});
+
+describe("formatEditDiff", () => {
+  it("wraps diff in markdown code block", () => {
+    const diff = "- old line\n+ new line";
+    const result = formatEditDiff(diff);
+    assert.ok(result.startsWith("```diff\n"));
+    assert.ok(result.endsWith("\n```"));
+    assert.ok(result.includes(diff));
+  });
+
+  it("handles empty diff", () => {
+    const result = formatEditDiff("");
+    assert.ok(result.includes("(empty diff)"));
+  });
+
+  it("truncates long diffs", () => {
+    const long = "a".repeat(4000);
+    const result = formatEditDiff(long);
+    assert.ok(result.length <= 3600);
+    assert.ok(result.endsWith("\n...\n```"));
   });
 });

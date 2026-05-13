@@ -235,6 +235,15 @@ export function formatAssistantText(text: string): string {
 	return `🤖 ${text}`;
 }
 
+export function formatEditDiff(diff: string): string {
+	const MAX_DIFF = 3500;
+	const trimmed = diff.trim();
+	if (trimmed.length === 0) return "```diff\n(empty diff)\n```";
+	if (trimmed.length <= MAX_DIFF) return `\`\`\`diff\n${trimmed}\n\`\`\``;
+	const truncated = trimmed.slice(0, MAX_DIFF);
+	return `\`\`\`diff\n${truncated}\n...\n\`\`\``;
+}
+
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
 }
@@ -364,6 +373,7 @@ export default function (pi: ExtensionAPI) {
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let mirrorPreviewState: TelegramPreviewState | undefined;
+	const mirrorToolMessages = new Map<string, number>();
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
@@ -603,7 +613,7 @@ export default function (pi: ExtensionAPI) {
 			const draftId = state.draftId ?? allocateDraftId();
 			state.draftId = draftId;
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				await sendWithMarkdown("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
 				draftSupport = "supported";
 				state.mode = "draft";
 				state.lastSentText = truncated;
@@ -614,13 +624,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
 			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		await sendWithMarkdown("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -642,12 +652,28 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
 			await mirrorClearPreview(chatId);
 			return true;
 		}
 		mirrorPreviewState = undefined;
 		return state.messageId !== undefined;
+	}
+
+	async function sendWithMarkdown<TResponse>(
+		method: string,
+		body: Record<string, unknown>,
+	): Promise<TResponse> {
+		try {
+			return await callTelegram<TResponse>(method, { ...body, parse_mode: "MarkdownV2" });
+		} catch (error) {
+			const msg = error instanceof Error ? error.message : String(error);
+			if (msg.includes("can't parse entities") || msg.includes("parse")) {
+				const { parse_mode: _, ...plainBody } = body;
+				return await callTelegram<TResponse>(method, plainBody);
+			}
+			throw error;
+		}
 	}
 
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
@@ -1190,6 +1216,7 @@ export default function (pi: ExtensionAPI) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
 		mediaGroups.clear();
+		mirrorToolMessages.clear();
 		if (mirrorPreviewState && config.allowedUserId !== undefined) {
 			await mirrorClearPreview(config.allowedUserId);
 		}
@@ -1228,11 +1255,33 @@ export default function (pi: ExtensionAPI) {
 		if (mirrorChatId === undefined) return;
 		const text = formatToolCall(event.toolName, event.input as Record<string, unknown>);
 		try {
-			await callTelegram("sendMessage", { chat_id: mirrorChatId, text });
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: mirrorChatId, text });
+			mirrorToolMessages.set(event.toolCallId, sent.message_id);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("[telegram mirror] tool_call send failed:", message);
 		}
+	});
+
+	pi.on("tool_result", async (event) => {
+		if (!isMirrorTurn) return;
+		if (activeTelegramTurn) return;
+		const mirrorChatId = config.allowedUserId;
+		if (mirrorChatId === undefined) return;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const details = (event as any).details;
+		if (!details || typeof details.diff !== "string") return;
+		const diffText = formatEditDiff(details.diff);
+		const replyTo = mirrorToolMessages.get(event.toolCallId);
+		try {
+			const body: Record<string, unknown> = { chat_id: mirrorChatId, text: diffText, parse_mode: "MarkdownV2" };
+			if (replyTo !== undefined) body.reply_to_message_id = replyTo;
+			await callTelegram("sendMessage", body);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error("[telegram mirror] edit diff send failed:", message);
+		}
+		mirrorToolMessages.delete(event.toolCallId);
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -1326,7 +1375,15 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					await mirrorClearPreview(mirrorChatId);
 					if (finalText) {
-						await sendTextReply(mirrorChatId, 0, finalText);
+						const chunks = chunkParagraphs(finalText);
+						for (const chunk of chunks) {
+							try {
+								await sendWithMarkdown("sendMessage", { chat_id: mirrorChatId, text: chunk });
+							} catch (error) {
+								const message = error instanceof Error ? error.message : String(error);
+								console.error("[telegram mirror] final response chunk send failed:", message);
+							}
+						}
 					}
 				}
 			}
