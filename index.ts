@@ -171,12 +171,11 @@ Telegram bridge extension is active.
 export function formatPrompt(text: string): string {
 	const trimmed = text.trim();
 	if (trimmed.length === 0) return "💬 You: (empty)";
-	const firstLine = trimmed.split("\n")[0]!;
-	const MAX_PROMPT = 200;
-	if (firstLine.length > MAX_PROMPT) {
-		return `💬 You: ${firstLine.slice(0, MAX_PROMPT)}…`;
+	const MAX_PROMPT = 400;
+	if (trimmed.length > MAX_PROMPT) {
+		return `💬 You: ${trimmed.slice(0, MAX_PROMPT)}…`;
 	}
-	return `💬 You: ${firstLine}`;
+	return `💬 You: ${trimmed}`;
 }
 
 export function formatToolCall(toolName: string, args: Record<string, unknown>): string {

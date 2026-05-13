@@ -12,21 +12,21 @@ describe("formatPrompt", () => {
   });
 
   it("truncates long text with ellipsis", () => {
-    const long = "a".repeat(300);
+    const long = "a".repeat(500);
     const result = formatPrompt(long);
     assert.ok(result.startsWith("💬 You: "));
     assert.ok(result.endsWith("…"));
-    assert.ok(result.length <= 210); // prefix + 200 chars + ellipsis
+    assert.ok(result.length <= 410); // prefix + 400 chars + ellipsis
   });
 
   it("handles empty string", () => {
     assert.equal(formatPrompt(""), "💬 You: (empty)");
   });
 
-  it("handles multiline input by taking first line", () => {
+  it("preserves multiline input", () => {
     assert.equal(
-      formatPrompt("first line\nsecond line\nthird line"),
-      "💬 You: first line",
+      formatPrompt("first line\nsecond line"),
+      "💬 You: first line\nsecond line",
     );
   });
 });
