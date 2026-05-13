@@ -537,7 +537,7 @@ export default function (pi: ExtensionAPI) {
 			const draftId = state.draftId ?? allocateDraftId();
 			state.draftId = draftId;
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				await sendWithMarkdown("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
 				draftSupport = "supported";
 				state.mode = "draft";
 				state.lastSentText = truncated;
@@ -548,13 +548,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
 			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		await sendWithMarkdown("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -576,7 +576,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
 			await clearPreview(chatId);
 			return true;
 		}
@@ -665,10 +665,11 @@ export default function (pi: ExtensionAPI) {
 		body: Record<string, unknown>,
 	): Promise<TResponse> {
 		try {
-			return await callTelegram<TResponse>(method, { ...body, parse_mode: "MarkdownV2" });
+			return await callTelegram<TResponse>(method, { ...body, parse_mode: "Markdown" });
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
 			if (msg.includes("can't parse entities") || msg.includes("parse")) {
+				console.error("[telegram mirror] Markdown parse failed, falling back to plain text:", msg);
 				const { parse_mode: _, ...plainBody } = body;
 				return await callTelegram<TResponse>(method, plainBody);
 			}
@@ -676,11 +677,11 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
+	async function sendFormattedText(chatId: number, text: string): Promise<number | undefined> {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", {
 				chat_id: chatId,
 				text: chunk,
 			});
@@ -706,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
+				await sendFormattedText(turn.chatId, `Failed to send attachment ${attachment.fileName}: ${message}`);
 			}
 		}
 	}
@@ -919,28 +920,28 @@ export default function (pi: ExtensionAPI) {
 				}
 				currentAbort();
 				updateStatus(ctx);
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborted current turn.");
+				await sendFormattedText(firstMessage.chat.id, "Aborted current turn.");
 			} else {
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "No active turn.");
+				await sendFormattedText(firstMessage.chat.id, "No active turn.");
 			}
 			return;
 		}
 
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
+				await sendFormattedText(firstMessage.chat.id, "Cannot compact while pi is busy. Send \"stop\" first.");
 				return;
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					void sendFormattedText(firstMessage.chat.id, "Compaction completed.");
 				},
 				onError: (error) => {
 					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					void sendFormattedText(firstMessage.chat.id, `Compaction failed: ${message}`);
 				},
 			});
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			await sendFormattedText(firstMessage.chat.id, "Compaction started.");
 			return;
 		}
 
@@ -993,14 +994,13 @@ export default function (pi: ExtensionAPI) {
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
+			await sendFormattedText(firstMessage.chat.id, lines.join("\n"));
 			return;
 		}
 
 		if (lower === "/help" || lower === "/start") {
-			await sendTextReply(
+			await sendFormattedText(
 				firstMessage.chat.id,
-				firstMessage.message_id,
 				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
@@ -1049,11 +1049,11 @@ export default function (pi: ExtensionAPI) {
 			config.allowedUserId = message.from.id;
 			await writeConfig(config);
 			updateStatus(ctx);
-			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
+			await sendFormattedText(message.chat.id, "Telegram bridge paired with this account.");
 		}
 
 		if (message.from.id !== config.allowedUserId) {
-			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
+			await sendFormattedText(message.chat.id, "This bot is not authorized for your account.");
 			return;
 		}
 
@@ -1241,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 		startTypingLoop(ctx, mirrorChatId);
 		const text = formatPrompt(event.text);
 		try {
-			await callTelegram("sendMessage", { chat_id: mirrorChatId, text });
+			await sendWithMarkdown("sendMessage", { chat_id: mirrorChatId, text });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("[telegram mirror] input send failed:", message);
@@ -1255,7 +1255,7 @@ export default function (pi: ExtensionAPI) {
 		if (mirrorChatId === undefined) return;
 		const text = formatToolCall(event.toolName, event.input as Record<string, unknown>);
 		try {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: mirrorChatId, text });
+			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: mirrorChatId, text });
 			mirrorToolMessages.set(event.toolCallId, sent.message_id);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -1274,9 +1274,9 @@ export default function (pi: ExtensionAPI) {
 		const diffText = formatEditDiff(details.diff);
 		const replyTo = mirrorToolMessages.get(event.toolCallId);
 		try {
-			const body: Record<string, unknown> = { chat_id: mirrorChatId, text: diffText, parse_mode: "MarkdownV2" };
+			const body: Record<string, unknown> = { chat_id: mirrorChatId, text: diffText };
 			if (replyTo !== undefined) body.reply_to_message_id = replyTo;
-			await callTelegram("sendMessage", body);
+			await sendWithMarkdown("sendMessage", body);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("[telegram mirror] edit diff send failed:", message);
@@ -1397,7 +1397,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (assistant.stopReason === "error") {
 			await clearPreview(turn.chatId);
-			await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
+			await sendFormattedText(turn.chatId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
 			return;
 		}
 
@@ -1409,14 +1409,14 @@ export default function (pi: ExtensionAPI) {
 		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
 			const finalized = await finalizePreview(turn.chatId);
 			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				await sendFormattedText(turn.chatId, "Attached requested file(s).");
 			}
 		} else {
 			await clearPreview(turn.chatId);
 			if (finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+				await sendFormattedText(turn.chatId, finalText);
 			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				await sendFormattedText(turn.chatId, "Attached requested file(s).");
 			}
 		}
 
