@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatPrompt, formatToolCall, formatError, formatAssistantText, formatEditDiff } from "./index";
+import { stat } from "node:fs/promises";
+import { formatPrompt, formatToolCall, formatError, formatAssistantText, formatEditDiff, renderTableToPng, extractTableSegments } from "./index";
 
 describe("formatPrompt", () => {
   it("returns a formatted prompt with emoji prefix", () => {
@@ -27,6 +28,21 @@ describe("formatPrompt", () => {
     assert.equal(
       formatPrompt("first line\nsecond line"),
       "💬 You: first line\nsecond line",
+    );
+  });
+
+  it("puts prefix on its own line for blockquote lines", () => {
+    assert.equal(formatPrompt("> hey"), "💬 You:\n> hey");
+  });
+
+  it("keeps inline prefix when no blockquote", () => {
+    assert.equal(formatPrompt("hey"), "💬 You: hey");
+  });
+
+  it("puts prefix on its own line when any line is a blockquote", () => {
+    assert.equal(
+      formatPrompt("context\n> quote\nmore"),
+      "💬 You:\ncontext\n> quote\nmore",
     );
   });
 });
@@ -186,5 +202,49 @@ describe("formatEditDiff", () => {
     const result = formatEditDiff(long);
     assert.ok(result.length <= 3600);
     assert.ok(result.endsWith("\n...\n```"));
+  });
+});
+
+describe("renderTableToPng", () => {
+  it("creates a PNG file from table lines", async () => {
+    const tmpPath = `/tmp/test-table-${Date.now()}.png`;
+    await renderTableToPng(
+      ["| Col A | Col B |", "|-------|-------|", "| val1  | val2  |"],
+      tmpPath,
+    );
+    const s = await stat(tmpPath);
+    assert.ok(s.isFile());
+    assert.ok(s.size > 0);
+  });
+});
+
+describe("extractTableSegments", () => {
+  it("returns single text segment when no table", async () => {
+    const segments = await extractTableSegments("hello world");
+    assert.equal(segments.length, 1);
+    assert.equal(segments[0].type, "text");
+    assert.equal((segments[0] as { type: "text"; text: string }).text, "hello world");
+  });
+
+  it("extracts a table segment", async () => {
+    const segments = await extractTableSegments("| a | b |\n|---|---|\n| 1 | 2 |");
+    assert.equal(segments.length, 1);
+    assert.equal(segments[0].type, "table");
+    assert.deepEqual((segments[0] as { type: "table"; lines: string[] }).lines, ["| a | b |", "|---|---|", "| 1 | 2 |"]);
+  });
+
+  it("splits text and table", async () => {
+    const segments = await extractTableSegments("intro\n| a |\n| 1 |\noutro");
+    assert.equal(segments.length, 3);
+    assert.equal(segments[0].type, "text");
+    assert.equal(segments[1].type, "table");
+    assert.equal(segments[2].type, "text");
+  });
+
+  it("ignores table-like lines inside code blocks", async () => {
+    const segments = await extractTableSegments("```\n| a |\n```");
+    assert.equal(segments.length, 1);
+    assert.equal(segments[0].type, "text");
+    assert.ok((segments[0] as { type: "text"; text: string }).text.includes("| a |"));
   });
 });
