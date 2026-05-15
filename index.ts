@@ -242,6 +242,64 @@ export function formatAssistantText(text: string): string {
 	return `🤖 ${text}`;
 }
 
+export function mdToTelegramHtml(text: string): string {
+	// Strategy: process code blocks and inline code first (protect from further transformation),
+	// then apply markdown → HTML conversions on the remaining text.
+	//
+	// We use placeholder tokens to protect code spans from markdown transformations.
+	const CODE_PLACEHOLDER = "\x00CODE";
+	const protectedSpans: string[] = [];
+
+	const protect = (html: string): string => {
+		const idx = protectedSpans.length;
+		protectedSpans.push(html);
+		return `${CODE_PLACEHOLDER}${idx}\x00`;
+	};
+
+	const escapeHtml = (s: string): string =>
+		s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+	// 1. Extract and protect fenced code blocks
+	let result = text.replace(/```([\w.-]*)\n([\s\S]*?)```/g, (_match, lang: string, code: string) => {
+		const escaped = escapeHtml(code);
+		if (lang) {
+			return protect(`<pre><code class="language-${escapeHtml(lang)}">${escaped}</code></pre>`);
+		}
+		return protect(`<pre><code>${escaped}</code></pre>`);
+	});
+
+	// 2. Extract and protect inline code
+	result = result.replace(/`([^`]+)`/g, (_match, code: string) => {
+		return protect(`<code>${escapeHtml(code)}</code>`);
+	});
+
+	// 3. Escape HTML in the remaining text
+	result = escapeHtml(result);
+
+	// 4. Convert markdown constructs (order matters: bold+italic before bold/italic)
+	// Bold + italic: ***text***
+	result = result.replace(/\*\*\*(.+?)\*\*\*/g, "<b><i>$1</i></b>");
+	// Bold: **text**
+	result = result.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+	// Italic: *text*
+	result = result.replace(/\*(.+?)\*/g, "<i>$1</i>");
+	// Strikethrough: ~~text~~
+	result = result.replace(/~~(.+?)~~/g, "<s>$1</s>");
+	// Links: [text](url)
+	result = result.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+	// Headings: # through ######
+	result = result.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+	// Blockquotes: > text (only at start of line)
+	result = result.replace(/^&gt;\s?(.+)$/gm, "<blockquote>$1</blockquote>");
+
+	// 5. Restore protected code spans
+	result = result.replace(/\x00CODE(\d+)\x00/g, (_match, idx: string) => {
+		return protectedSpans[Number(idx)] ?? "";
+	});
+
+	return result;
+}
+
 export function formatEditDiff(diff: string): string {
 	const MAX_DIFF = 3500;
 	const trimmed = diff.trim();
@@ -773,26 +831,16 @@ export default function (pi: ExtensionAPI) {
 	): Promise<TResponse> {
 		const processedBody = { ...body };
 		if (typeof processedBody.text === "string") {
-			processedBody.text = formatTablesForTelegram(processedBody.text);
+			processedBody.text = mdToTelegramHtml(formatTablesForTelegram(processedBody.text));
 		}
-		// Try MarkdownV2 first for rich features (blockquote, spoiler, etc.)
 		try {
-			return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "MarkdownV2" });
+			return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "HTML" });
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
 			if (msg.includes("can't parse entities") || msg.includes("parse")) {
-				// Fallback to Markdown legacy (tolerates unescaped _ * etc.)
-				try {
-					return await callTelegram<TResponse>(method, { ...processedBody, parse_mode: "Markdown" });
-				} catch (error2) {
-					const msg2 = error2 instanceof Error ? error2.message : String(error2);
-					if (msg2.includes("can't parse entities") || msg2.includes("parse")) {
-						console.error("[telegram] MarkdownV2 + Markdown parse failed, falling back to plain text:", msg2);
-						const { parse_mode: _, ...plainBody } = processedBody;
-						return await callTelegram<TResponse>(method, plainBody);
-					}
-					throw error2;
-				}
+				console.error("[telegram] HTML parse failed, falling back to plain text:", msg);
+				const { parse_mode: _, ...plainBody } = processedBody;
+				return await callTelegram<TResponse>(method, plainBody);
 			}
 			throw error;
 		}

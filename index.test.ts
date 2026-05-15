@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { stat } from "node:fs/promises";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
-import { formatPrompt, formatToolCall, formatError, formatAssistantText, formatEditDiff, renderTableToPng, extractTableSegments } from "./index";
+import { formatPrompt, formatToolCall, formatError, formatAssistantText, formatEditDiff, renderTableToPng, extractTableSegments, mdToTelegramHtml } from "./index";
 
 describe("formatPrompt", () => {
   it("returns a formatted prompt with emoji prefix", () => {
@@ -276,6 +276,103 @@ describe("renderTableToPng", () => {
     bodyAvg /= (bodyRow.length / 4);
     // Header should be darker than body
     assert.ok(topAvg < bodyAvg, `Header ${topAvg.toFixed(0)} should be darker than body ${bodyAvg.toFixed(0)}`);
+  });
+});
+
+describe("mdToTelegramHtml", () => {
+  it("escapes HTML special characters", () => {
+    assert.equal(
+      mdToTelegramHtml("1 < 2 & 3 > 0"),
+      "1 &lt; 2 &amp; 3 &gt; 0",
+    );
+  });
+
+  it("leaves plain text untouched", () => {
+    assert.equal(mdToTelegramHtml("hello world"), "hello world");
+  });
+
+  it("converts bold", () => {
+    assert.equal(
+      mdToTelegramHtml("some **bold** text"),
+      "some <b>bold</b> text",
+    );
+  });
+
+  it("converts italic", () => {
+    assert.equal(
+      mdToTelegramHtml("some *italic* text"),
+      "some <i>italic</i> text",
+    );
+  });
+
+  it("converts inline code", () => {
+    assert.equal(
+      mdToTelegramHtml("use `npm test` to run"),
+      "use <code>npm test</code> to run",
+    );
+  });
+
+  it("converts code blocks with language", () => {
+    assert.equal(
+      mdToTelegramHtml("```js\nconsole.log(1)\n```"),
+      "<pre><code class=\"language-js\">console.log(1)\n</code></pre>",
+    );
+  });
+
+  it("converts code blocks without language", () => {
+    assert.equal(
+      mdToTelegramHtml("```\nhello\n```"),
+      "<pre><code>hello\n</code></pre>",
+    );
+  });
+
+  it("converts links", () => {
+    assert.equal(
+      mdToTelegramHtml("[click here](https://example.com)"),
+      '<a href="https://example.com">click here</a>',
+    );
+  });
+
+  it("converts blockquotes", () => {
+    assert.equal(
+      mdToTelegramHtml("> quoted text"),
+      "<blockquote>quoted text</blockquote>",
+    );
+  });
+
+  it("converts strikethrough", () => {
+    assert.equal(
+      mdToTelegramHtml("some ~~deleted~~ text"),
+      "some <s>deleted</s> text",
+    );
+  });
+
+  it("does not convert markdown inside inline code", () => {
+    assert.equal(
+      mdToTelegramHtml("use `**bold**` here"),
+      "use <code>**bold**</code> here",
+    );
+  });
+
+  it("does not convert markdown inside code blocks", () => {
+    assert.equal(
+      mdToTelegramHtml("```\n**not bold**\n```"),
+      "<pre><code>**not bold**\n</code></pre>",
+    );
+  });
+
+  it("handles bold+italic combo", () => {
+    assert.equal(
+      mdToTelegramHtml("***bold italic***"),
+      "<b><i>bold italic</i></b>",
+    );
+  });
+
+  it("converts headings to bold", () => {
+    assert.equal(
+      mdToTelegramHtml("# Title"),
+      "<b>Title</b>",
+    );
   });
 });
 
