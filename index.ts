@@ -258,6 +258,56 @@ function parseMarkdownCells(lines: string[]): string[][] {
 		.map((l) => l.split("|").slice(1, -1).map((c) => c.trim()));
 }
 
+type MarkdownRegion =
+	| { type: "text"; lines: string[] }
+	| { type: "table"; lines: string[] };
+
+function extractMarkdownRegions(text: string): MarkdownRegion[] {
+	const lines = text.split("\n");
+	const regions: MarkdownRegion[] = [];
+	let textBuffer: string[] = [];
+	let tableBuffer: string[] = [];
+	let inCodeBlock = false;
+
+	const flushText = (): void => {
+		if (textBuffer.length > 0) {
+			regions.push({ type: "text", lines: textBuffer });
+			textBuffer = [];
+		}
+	};
+
+	const flushTable = (): void => {
+		if (tableBuffer.length > 0) {
+			regions.push({ type: "table", lines: tableBuffer });
+			tableBuffer = [];
+		}
+	};
+
+	for (const line of lines) {
+		if (line.trim().startsWith("```")) {
+			if (tableBuffer.length > 0) flushTable();
+			inCodeBlock = !inCodeBlock;
+			textBuffer.push(line);
+			continue;
+		}
+		if (inCodeBlock) {
+			textBuffer.push(line);
+			continue;
+		}
+		const isTableRow = /^\s*\|/.test(line) || /^\s*\+[-+]/.test(line);
+		if (isTableRow) {
+			flushText();
+			tableBuffer.push(line);
+			continue;
+		}
+		if (tableBuffer.length > 0) flushTable();
+		textBuffer.push(line);
+	}
+	flushText();
+	flushTable();
+	return regions;
+}
+
 const emojiImageCache = new Map<string, ReturnType<typeof loadImage> | null>();
 
 async function loadEmojiImage(ch: string): Promise<ReturnType<typeof loadImage> | null> {
@@ -440,54 +490,16 @@ export async function renderTableToPng(tableLines: string[], outputPath: string)
 }
 
 export async function extractTableSegments(text: string): Promise<Array<{ type: "text"; text: string } | { type: "table"; lines: string[] }>> {
-	const lines = text.split("\n");
+	const regions = extractMarkdownRegions(text);
 	const segments: Array<{ type: "text"; text: string } | { type: "table"; lines: string[] }> = [];
-	let currentText: string[] = [];
-	let tableBuffer: string[] = [];
-	let inTable = false;
-	let inCodeBlock = false;
-
-	const flushText = (): void => {
-		if (currentText.length > 0) {
-			const t = currentText.join("\n").trim();
-			if (t.length > 0) segments.push({ type: "text", text: t });
-			currentText = [];
+	for (const region of regions) {
+		if (region.type === "table") {
+			segments.push({ type: "table", lines: region.lines });
+		} else {
+			const trimmed = region.lines.join("\n").trim();
+			if (trimmed.length > 0) segments.push({ type: "text", text: trimmed });
 		}
-	};
-
-	const flushTable = (): void => {
-		if (tableBuffer.length > 0) {
-			segments.push({ type: "table", lines: [...tableBuffer] });
-			tableBuffer = [];
-			inTable = false;
-		}
-	};
-
-	for (const line of lines) {
-		if (line.trim().startsWith("```")) {
-			if (inTable) flushTable();
-			inCodeBlock = !inCodeBlock;
-			currentText.push(line);
-			continue;
-		}
-		if (inCodeBlock) {
-			currentText.push(line);
-			continue;
-		}
-		const isTableRow = /^\s*\|/.test(line) || /^\s*\+[-+]/.test(line);
-		if (isTableRow) {
-			flushText();
-			if (!inTable) inTable = true;
-			tableBuffer.push(line);
-			continue;
-		}
-		if (inTable) {
-			flushTable();
-		}
-		currentText.push(line);
 	}
-	flushText();
-	if (inTable) flushTable();
 	return segments;
 }
 
@@ -618,8 +630,6 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let isMirrorTurn = false;
 	let setupInProgress = false;
-	let previewState: TelegramPreviewState | undefined;
-	let mirrorPreviewState: TelegramPreviewState | undefined;
 	const mirrorToolMessages = new Map<string, number>();
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
@@ -755,157 +765,7 @@ export default function (pi: ExtensionAPI) {
 			.trim();
 	}
 
-	async function clearPreview(chatId: number): Promise<void> {
-		const state = previewState;
-		if (!state) return;
-		if (state.flushTimer) {
-			clearTimeout(state.flushTimer);
-			state.flushTimer = undefined;
-		}
-		previewState = undefined;
-		if (state.mode === "draft" && state.draftId !== undefined) {
-			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
-			} catch {
-				// ignore
-			}
-		}
-	}
 
-	async function flushPreview(chatId: number): Promise<void> {
-		const state = previewState;
-		if (!state) return;
-		state.flushTimer = undefined;
-		const text = state.pendingText.trim();
-		if (!text || text === state.lastSentText) return;
-		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
-
-		if (draftSupport !== "unsupported") {
-			const draftId = state.draftId ?? allocateDraftId();
-			state.draftId = draftId;
-			try {
-				await sendWithMarkdown("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
-				draftSupport = "supported";
-				state.mode = "draft";
-				state.lastSentText = truncated;
-				return;
-			} catch {
-				draftSupport = "unsupported";
-			}
-		}
-
-		if (state.messageId === undefined) {
-			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
-			state.messageId = sent.message_id;
-			state.mode = "message";
-			state.lastSentText = truncated;
-			return;
-		}
-		await sendWithMarkdown("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
-		state.mode = "message";
-		state.lastSentText = truncated;
-	}
-
-	function schedulePreviewFlush(chatId: number): void {
-		if (!previewState || previewState.flushTimer) return;
-		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
-		}, PREVIEW_THROTTLE_MS);
-	}
-
-	async function finalizePreview(chatId: number): Promise<boolean> {
-		const state = previewState;
-		if (!state) return false;
-		await flushPreview(chatId);
-		const finalText = (state.pendingText.trim() || state.lastSentText).trim();
-		if (!finalText) {
-			await clearPreview(chatId);
-			return false;
-		}
-		if (state.mode === "draft") {
-			await sendFinalMessage(chatId, finalText);
-			await clearPreview(chatId);
-			return true;
-		}
-		previewState = undefined;
-		return state.messageId !== undefined;
-	}
-
-	async function mirrorClearPreview(chatId: number): Promise<void> {
-		const state = mirrorPreviewState;
-		if (!state) return;
-		if (state.flushTimer) {
-			clearTimeout(state.flushTimer);
-			state.flushTimer = undefined;
-		}
-		mirrorPreviewState = undefined;
-		if (state.mode === "draft" && state.draftId !== undefined) {
-			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
-			} catch {
-				// ignore
-			}
-		}
-	}
-
-	async function mirrorFlushPreview(chatId: number): Promise<void> {
-		const state = mirrorPreviewState;
-		if (!state) return;
-		state.flushTimer = undefined;
-		const text = state.pendingText.trim();
-		if (!text || text === state.lastSentText) return;
-		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
-
-		if (draftSupport !== "unsupported") {
-			const draftId = state.draftId ?? allocateDraftId();
-			state.draftId = draftId;
-			try {
-				await sendWithMarkdown("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
-				draftSupport = "supported";
-				state.mode = "draft";
-				state.lastSentText = truncated;
-				return;
-			} catch {
-				draftSupport = "unsupported";
-			}
-		}
-
-		if (state.messageId === undefined) {
-			const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
-			state.messageId = sent.message_id;
-			state.mode = "message";
-			state.lastSentText = truncated;
-			return;
-		}
-		await sendWithMarkdown("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
-		state.mode = "message";
-		state.lastSentText = truncated;
-	}
-
-	function mirrorSchedulePreviewFlush(chatId: number): void {
-		if (!mirrorPreviewState || mirrorPreviewState.flushTimer) return;
-		mirrorPreviewState.flushTimer = setTimeout(() => {
-			void mirrorFlushPreview(chatId);
-		}, PREVIEW_THROTTLE_MS);
-	}
-
-	async function mirrorFinalizePreview(chatId: number): Promise<boolean> {
-		const state = mirrorPreviewState;
-		if (!state) return false;
-		await mirrorFlushPreview(chatId);
-		const finalText = (state.pendingText.trim() || state.lastSentText).trim();
-		if (!finalText) {
-			await mirrorClearPreview(chatId);
-			return false;
-		}
-		if (state.mode === "draft") {
-			await sendFinalMessage(chatId, finalText);
-			await mirrorClearPreview(chatId);
-			return true;
-		}
-		mirrorPreviewState = undefined;
-		return state.messageId !== undefined;
-	}
 
 	async function sendWithMarkdown<TResponse>(
 		method: string,
@@ -939,45 +799,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function formatTablesForTelegram(text: string): string {
-		const lines = text.split("\n");
-		const out: string[] = [];
-		let inTable = false;
-		let tableBuffer: string[] = [];
-		let inCodeBlock = false;
-
-		const flushTable = (): void => {
-			if (tableBuffer.length === 0) return;
-			out.push("```");
-			out.push(...tableBuffer);
-			out.push("```");
-			tableBuffer = [];
-			inTable = false;
-		};
-
-		for (const line of lines) {
-			if (line.trim().startsWith("```")) {
-				if (inTable) flushTable();
-				inCodeBlock = !inCodeBlock;
-				out.push(line);
-				continue;
-			}
-			if (inCodeBlock) {
-				out.push(line);
-				continue;
-			}
-			const isTableRow = /^\s*\|/.test(line) || /^\s*\+[-+]/.test(line);
-			if (isTableRow) {
-				if (!inTable) inTable = true;
-				tableBuffer.push(line);
-				continue;
-			}
-			if (inTable) {
-				flushTable();
-			}
-			out.push(line);
-		}
-		if (inTable) flushTable();
-		return out.join("\n");
+		return extractMarkdownRegions(text)
+			.flatMap((region) => {
+				if (region.type === "table") {
+					return ["```", ...region.lines, "```"];
+				}
+				return region.lines;
+			})
+			.join("\n");
 	}
 
 	async function sendFinalMessage(chatId: number, text: string, replyToMessageId?: number): Promise<number | undefined> {
@@ -1065,6 +894,125 @@ export default function (pi: ExtensionAPI) {
 		}
 		return {};
 	}
+
+	// --- Preview manager ---
+	// Encapsulates the draft/message streaming preview lifecycle.
+	// Instantiated once for active telegram turns and once for mirror turns.
+	function createPreviewManager() {
+		let state: TelegramPreviewState | undefined;
+
+		function isActive(): boolean {
+			return state !== undefined;
+		}
+
+		function hasContent(): boolean {
+			return state !== undefined && (state.pendingText.trim().length > 0 || state.lastSentText.trim().length > 0);
+		}
+
+		function getPendingText(): string {
+			return state?.pendingText ?? "";
+		}
+
+		function setPendingText(text: string): void {
+			if (state) state.pendingText = text;
+		}
+
+		function reset(): void {
+			if (state?.flushTimer) clearTimeout(state.flushTimer);
+			state = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		}
+
+		function discard(): void {
+			if (state?.flushTimer) clearTimeout(state.flushTimer);
+			state = undefined;
+		}
+
+		async function clear(chatId: number): Promise<void> {
+			const s = state;
+			if (!s) return;
+			if (s.flushTimer) clearTimeout(s.flushTimer);
+			state = undefined;
+			if (s.mode === "draft" && s.draftId !== undefined) {
+				try {
+					await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: s.draftId, text: "" });
+				} catch {
+					// ignore
+				}
+			}
+		}
+
+		async function flush(chatId: number): Promise<void> {
+			const s = state;
+			if (!s) return;
+			s.flushTimer = undefined;
+			const text = s.pendingText.trim();
+			if (!text || text === s.lastSentText) return;
+			const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+
+			if (draftSupport !== "unsupported") {
+				const draftId = s.draftId ?? allocateDraftId();
+				s.draftId = draftId;
+				try {
+					await sendWithMarkdown("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+					draftSupport = "supported";
+					s.mode = "draft";
+					s.lastSentText = truncated;
+					return;
+				} catch {
+					draftSupport = "unsupported";
+				}
+			}
+
+			if (s.messageId === undefined) {
+				const sent = await sendWithMarkdown<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+				s.messageId = sent.message_id;
+				s.mode = "message";
+				s.lastSentText = truncated;
+				return;
+			}
+			await sendWithMarkdown("editMessageText", { chat_id: chatId, message_id: s.messageId, text: truncated });
+			s.mode = "message";
+			s.lastSentText = truncated;
+		}
+
+		function scheduleFlush(chatId: number): void {
+			if (!state || state.flushTimer) return;
+			state.flushTimer = setTimeout(() => {
+				void flush(chatId);
+			}, PREVIEW_THROTTLE_MS);
+		}
+
+		function updateText(text: string, chatId: number): void {
+			if (!state) {
+				state = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			}
+			state.pendingText = text;
+			scheduleFlush(chatId);
+		}
+
+		async function finalize(chatId: number): Promise<boolean> {
+			const s = state;
+			if (!s) return false;
+			await flush(chatId);
+			const finalText = (s.pendingText.trim() || s.lastSentText).trim();
+			if (!finalText) {
+				await clear(chatId);
+				return false;
+			}
+			if (s.mode === "draft") {
+				await sendFinalMessage(chatId, finalText);
+				await clear(chatId);
+				return true;
+			}
+			state = undefined;
+			return s.messageId !== undefined;
+		}
+
+		return { isActive, hasContent, getPendingText, setPendingText, reset, discard, clear, flush, scheduleFlush, updateText, finalize };
+	}
+
+	const activePreview = createPreviewManager();
+	const mirrorPreview = createPreviewManager();
 
 	function collectTelegramFileInfos(messages: TelegramMessage[]): TelegramFileInfo[] {
 		const files: TelegramFileInfo[] = [];
@@ -1553,13 +1501,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		mediaGroups.clear();
 		mirrorToolMessages.clear();
-		if (mirrorPreviewState && config.allowedUserId !== undefined) {
-			await mirrorClearPreview(config.allowedUserId);
+		if (mirrorPreview.isActive() && config.allowedUserId !== undefined) {
+			await mirrorPreview.clear(config.allowedUserId);
 		}
-		mirrorPreviewState = undefined;
+		mirrorPreview.discard();
 		if (activeTelegramTurn) {
-			await clearPreview(activeTelegramTurn.chatId);
+			await activePreview.clear(activeTelegramTurn.chatId);
 		}
+		activePreview.discard();
 		activeTelegramTurn = undefined;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
@@ -1635,7 +1584,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+				activePreview.reset();
 				startTypingLoop(ctx);
 			}
 		}
@@ -1644,39 +1593,31 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (activeTelegramTurn && isAssistantMessage(event.message)) {
-			if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
-				await finalizePreview(activeTelegramTurn.chatId);
+			if (activePreview.hasContent()) {
+				await activePreview.finalize(activeTelegramTurn.chatId);
 			}
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			activePreview.reset();
 			return;
 		}
 		if (!activeTelegramTurn && isMirrorTurn && isAssistantMessage(event.message)) {
 			const mirrorChatId = config.allowedUserId;
 			if (mirrorChatId === undefined) return;
-			if (mirrorPreviewState && (mirrorPreviewState.pendingText.trim().length > 0 || mirrorPreviewState.lastSentText.trim().length > 0)) {
-				await mirrorFinalizePreview(mirrorChatId);
+			if (mirrorPreview.hasContent()) {
+				await mirrorPreview.finalize(mirrorChatId);
 			}
-			mirrorPreviewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			mirrorPreview.reset();
 		}
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (activeTelegramTurn && isAssistantMessage(event.message)) {
-			if (!previewState) {
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
-			}
-			previewState.pendingText = getMessageText(event.message);
-			schedulePreviewFlush(activeTelegramTurn.chatId);
+			activePreview.updateText(getMessageText(event.message), activeTelegramTurn.chatId);
 			return;
 		}
 		if (!activeTelegramTurn && isMirrorTurn && isAssistantMessage(event.message)) {
 			const mirrorChatId = config.allowedUserId;
 			if (mirrorChatId === undefined) return;
-			if (!mirrorPreviewState) {
-				mirrorPreviewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
-			}
-			mirrorPreviewState.pendingText = formatAssistantText(getMessageText(event.message));
-			mirrorSchedulePreviewFlush(mirrorChatId);
+			mirrorPreview.updateText(formatAssistantText(getMessageText(event.message)), mirrorChatId);
 		}
 	});
 
@@ -1691,25 +1632,21 @@ export default function (pi: ExtensionAPI) {
 		// Mirror finalization (terminal/RPC-initiated turns)
 		if (!turn) {
 			const mirrorChatId = config.allowedUserId;
-			if (mirrorChatId !== undefined && mirrorPreviewState) {
+			if (mirrorChatId !== undefined && mirrorPreview.isActive()) {
 				const assistant = extractAssistantText(event.messages);
-				if (assistant.stopReason === "aborted") {
-					await mirrorClearPreview(mirrorChatId);
-					return;
-				}
-				if (assistant.stopReason === "error") {
-					await mirrorClearPreview(mirrorChatId);
+				if (assistant.stopReason === "aborted" || assistant.stopReason === "error") {
+					await mirrorPreview.clear(mirrorChatId);
 					return;
 				}
 				const rawText = assistant.text;
 				const finalText = rawText !== undefined
 					? formatAssistantText(rawText)
-					: mirrorPreviewState.pendingText || "";
-				mirrorPreviewState.pendingText = finalText;
+					: mirrorPreview.getPendingText() || "";
+				mirrorPreview.setPendingText(finalText);
 				if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-					await mirrorFinalizePreview(mirrorChatId);
+					await mirrorPreview.finalize(mirrorChatId);
 				} else {
-					await mirrorClearPreview(mirrorChatId);
+					await mirrorPreview.clear(mirrorChatId);
 					if (finalText) {
 						const chunks = chunkParagraphs(finalText);
 						for (const chunk of chunks) {
@@ -1728,27 +1665,27 @@ export default function (pi: ExtensionAPI) {
 
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
-			await clearPreview(turn.chatId);
+			await activePreview.clear(turn.chatId);
 			return;
 		}
 		if (assistant.stopReason === "error") {
-			await clearPreview(turn.chatId);
+			await activePreview.clear(turn.chatId);
 			await sendFormattedText(turn.chatId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
 			return;
 		}
 
 		const finalText = assistant.text;
-		if (previewState) {
-			previewState.pendingText = finalText ?? previewState.pendingText;
+		if (finalText !== undefined) {
+			activePreview.setPendingText(finalText);
 		}
 
 		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-			const finalized = await finalizePreview(turn.chatId);
+			const finalized = await activePreview.finalize(turn.chatId);
 			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
 				await sendFormattedText(turn.chatId, "Attached requested file(s).");
 			}
 		} else {
-			await clearPreview(turn.chatId);
+			await activePreview.clear(turn.chatId);
 			if (finalText) {
 				await sendFormattedText(turn.chatId, finalText);
 			} else if (turn.queuedAttachments.length > 0) {
