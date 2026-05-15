@@ -1564,6 +1564,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("input", async (event, ctx) => {
+		if (!pollingPromise) return;
 		const mirrorChatId = config.allowedUserId;
 		if (mirrorChatId === undefined) return;
 		if (event.source === "extension") {
