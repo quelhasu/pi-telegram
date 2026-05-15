@@ -1523,6 +1523,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await startPolling(ctx);
+			// If the agent is already running (not a Telegram-initiated turn),
+			// activate mirror immediately so the user can follow from this point on.
+			if (!ctx.isIdle() && !activeTelegramTurn && config.allowedUserId !== undefined) {
+				isMirrorTurn = true;
+				startTypingLoop(ctx, config.allowedUserId);
+			}
 			updateStatus(ctx);
 		},
 	});
